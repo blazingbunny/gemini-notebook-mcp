@@ -1,0 +1,12 @@
+node_modules/
+dist/
+client_secret*.json
+tokens.json
+*token*.json
+.auth-state.json
+.env
+.env.*
+*.pem
+*.key
+*.log
+.DS_Store
