@@ -366,12 +366,36 @@ function writeJsonAtomic(
   createBackup: boolean
 ): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  if (createBackup && fs.existsSync(filePath)) {
-    fs.copyFileSync(filePath, `${filePath}.bak`);
+  let existingMode: number | undefined;
+  if (fs.existsSync(filePath)) {
+    try {
+      existingMode = fs.statSync(filePath).mode & 0o777;
+    } catch {
+      existingMode = undefined;
+    }
+    if (createBackup) {
+      const backupPath = `${filePath}.bak`;
+      fs.copyFileSync(filePath, backupPath);
+      try {
+        fs.chmodSync(backupPath, existingMode ?? 0o600);
+      } catch {
+        // Ignore chmod errors on platforms/filesystems without POSIX permissions
+      }
+    }
   }
   const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}`;
   try {
-    fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2) + "\n", "utf8");
+    fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2) + "\n", {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    if (existingMode !== undefined) {
+      try {
+        fs.chmodSync(tmpPath, existingMode);
+      } catch {
+        // Ignore chmod errors on platforms/filesystems without POSIX permissions
+      }
+    }
     fs.renameSync(tmpPath, filePath);
   } catch (err) {
     try {

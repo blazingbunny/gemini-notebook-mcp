@@ -83,7 +83,7 @@ async function main(): Promise<void> {
   if (args[0] === "--exchange") {
     const codeOrUrl = args[1];
     if (!codeOrUrl) {
-      console.error("Usage: node dist/auth-cli.js --exchange <redirect-url-or-code>");
+      console.error("Usage: node dist/auth-cli.js --exchange <redirect-url>");
       process.exit(1);
     }
     let pending: PendingAuthState | undefined;
@@ -123,7 +123,7 @@ async function main(): Promise<void> {
 
   const rl = readline.createInterface({ input, output });
   try {
-    const pasted = await rl.question("Paste redirect URL (or code): ");
+    const pasted = await rl.question("Paste full redirect URL (http://localhost/...): ");
     const tokens = await exchangeAuthorizationCode(pasted, pending);
     if (fs.existsSync(statePath)) {
       fs.unlinkSync(statePath);
