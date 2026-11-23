@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -16,6 +17,7 @@ const DEFAULT_TOKEN_URI = "https://oauth2.googleapis.com/token";
 const DEFAULT_AUTH_URI = "https://accounts.google.com/o/oauth2/auth";
 const DEFAULT_REDIRECT_URI = "http://localhost";
 const EXPIRY_BUFFER_MS = 60_000;
+const PENDING_AUTH_MAX_AGE_MS = 15 * 60 * 1000;
 
 export interface OAuthClientConfig {
   client_id: string;
@@ -149,10 +151,22 @@ export function parseCodeFromRedirectInput(
     if (!code) {
       throw new Error("No 'code' query parameter found in the pasted redirect URL.");
     }
-    if (expectedState && state && state !== expectedState) {
-      throw new Error("OAuth state mismatch. Please generate a fresh authorization URL and try again.");
+    if (expectedState) {
+      if (!state) {
+        throw new Error(
+          "Missing 'state' query parameter in redirect URL. Please paste the full redirect URL from your browser."
+        );
+      }
+      if (state !== expectedState) {
+        throw new Error("OAuth state mismatch. Please generate a fresh authorization URL and try again.");
+      }
     }
     return { code, state };
+  }
+  if (expectedState) {
+    throw new Error(
+      "OAuth state verification requires the full redirect URL (including the 'state' query parameter), not a bare authorization code."
+    );
   }
   return { code: trimmed };
 }
@@ -161,6 +175,14 @@ export async function exchangeAuthorizationCode(
   codeOrUrl: string,
   pending?: PendingAuthState
 ): Promise<StoredTokens> {
+  if (
+    typeof pending?.created_at === "number" &&
+    Date.now() - pending.created_at > PENDING_AUTH_MAX_AGE_MS
+  ) {
+    throw new Error(
+      "OAuth authorization state has expired (older than 15 minutes). Please generate a fresh authorization URL and try again."
+    );
+  }
   const cfg = loadOAuthClientConfig();
   const { code } = parseCodeFromRedirectInput(codeOrUrl, pending?.state);
 
@@ -256,11 +278,10 @@ async function refreshOAuthToken(existing: StoredTokens): Promise<StoredTokens> 
 }
 
 async function getAdcToken(): Promise<AuthResult> {
+  const defaultGcloudPath = path.join(os.homedir(), "google-cloud-sdk/bin/gcloud");
   const gcloudBin =
     process.env.GCLOUD_BIN ||
-    (fs.existsSync(path.join(process.env.HOME || "", "google-cloud-sdk/bin/gcloud"))
-      ? path.join(process.env.HOME || "", "google-cloud-sdk/bin/gcloud")
-      : "gcloud");
+    (fs.existsSync(defaultGcloudPath) ? defaultGcloudPath : "gcloud");
 
   const { stdout } = await execFileAsync(gcloudBin, [
     "auth",
@@ -279,7 +300,12 @@ export class AuthManager {
   private inflightRefresh: Promise<AuthResult> | null = null;
 
   async getAuth(forceRefresh = false): Promise<AuthResult> {
-    if (process.env.NOTEBOOK_ACCESS_TOKEN && !forceRefresh) {
+    if (process.env.NOTEBOOK_ACCESS_TOKEN) {
+      if (forceRefresh) {
+        throw new Error(
+          "NOTEBOOK_ACCESS_TOKEN was rejected (expired or unauthorized) and cannot be refreshed automatically. Please replace NOTEBOOK_ACCESS_TOKEN with a fresh token or unset it to use OAuth/ADC."
+        );
+      }
       return {
         accessToken: process.env.NOTEBOOK_ACCESS_TOKEN,
         quotaProject: process.env.NOTEBOOK_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT,
@@ -296,9 +322,10 @@ export class AuthManager {
       // Fall back to ADC if explicitly configured or available, otherwise instruct user to run npm run auth
       try {
         return await getAdcToken();
-      } catch {
+      } catch (err) {
+        const adcMessage = err instanceof Error ? err.message : String(err);
         throw new Error(
-          `No OAuth tokens found at ${getTokenPath()}. Run "npm run auth" in ${REPO_ROOT} to authenticate your personal Google Account.`
+          `No OAuth tokens found at ${getTokenPath()}, and ADC fallback failed (${adcMessage}). Run "npm run auth" in ${REPO_ROOT} to authenticate your personal Google Account.`
         );
       }
     }

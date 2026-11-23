@@ -1,6 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
-import { AuthManager } from "./auth.js";
+import {
+  AuthManager,
+  type AuthResult,
+  getClientSecretPath,
+  getPendingAuthStatePath,
+  getTokenPath,
+} from "./auth.js";
 
 const API_BASE = "https://notebook.googleapis.com/v1";
 const UPLOAD_BASE = "https://notebook.googleapis.com/upload/v1";
@@ -123,6 +129,15 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function resolveRealOrAbsolutePath(targetPath: string): Promise<string> {
+  const resolved = path.resolve(targetPath);
+  try {
+    return await fs.promises.realpath(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
 function formatApiError(status: number, bodyText: string): string {
   let parsed: { error?: { code?: number; message?: string; status?: string } } | null = null;
   try {
@@ -159,12 +174,18 @@ export class NotebookApiClient {
       method?: string;
       body?: BodyInit | null;
       headers?: Record<string, string>;
+      retryOn5xx?: boolean;
+      deadlineMs?: number;
     } = {}
   ): Promise<T> {
+    const method = (init.method ?? "GET").toUpperCase();
+    const retryOn5xx = init.retryOn5xx ?? method === "GET";
     let refreshedOnce = false;
+    let pendingAuth: AuthResult | null = null;
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-      const authResult = await this.auth.getAuth(refreshedOnce && attempt > 0);
+      const authResult = pendingAuth ?? (await this.auth.getAuth(false));
+      pendingAuth = null;
       const headers: Record<string, string> = {
         Authorization: `Bearer ${authResult.accessToken}`,
         ...init.headers,
@@ -174,7 +195,7 @@ export class NotebookApiClient {
       }
 
       const resp = await fetch(url, {
-        method: init.method ?? "GET",
+        method,
         headers,
         body: init.body,
       });
@@ -186,15 +207,19 @@ export class NotebookApiClient {
         return JSON.parse(text) as T;
       }
 
-      // Retry once on 401 by forcing a token refresh
-      if (resp.status === 401 && !refreshedOnce) {
+      // Retry once on 401 by forcing a token refresh and reusing the refreshed token on the next attempt
+      if (resp.status === 401 && !refreshedOnce && attempt < MAX_RETRIES) {
+        if (init.deadlineMs !== undefined && Date.now() >= init.deadlineMs) {
+          throw new Error(formatApiError(resp.status, text));
+        }
         refreshedOnce = true;
-        await this.auth.getAuth(true);
+        pendingAuth = await this.auth.getAuth(true);
         continue;
       }
 
-      // Retry on 429 or transient 5xx
-      if ((resp.status === 429 || resp.status >= 500) && attempt < MAX_RETRIES) {
+      // Retry on 429, or transient 5xx only when retryOn5xx is enabled (defaults to GET)
+      const isRetryableStatus = resp.status === 429 || (resp.status >= 500 && retryOn5xx);
+      if (isRetryableStatus && attempt < MAX_RETRIES) {
         let parsedErr: unknown = null;
         try {
           parsedErr = JSON.parse(text);
@@ -202,8 +227,18 @@ export class NotebookApiClient {
           // ignore
         }
         const retryInfoMs = parseRetryDelayMs(parsedErr);
-        const backoffMs = retryInfoMs ?? Math.min(1000 * 2 ** attempt, 16_000) + Math.random() * 400;
+        let backoffMs = retryInfoMs ?? Math.min(1000 * 2 ** attempt, 16_000) + Math.random() * 400;
+        if (init.deadlineMs !== undefined) {
+          const remainingMs = init.deadlineMs - Date.now();
+          if (remainingMs <= 0) {
+            throw new Error(formatApiError(resp.status, text));
+          }
+          backoffMs = Math.min(backoffMs, remainingMs);
+        }
         await sleep(backoffMs);
+        if (init.deadlineMs !== undefined && Date.now() >= init.deadlineMs) {
+          throw new Error(formatApiError(resp.status, text));
+        }
         continue;
       }
 
@@ -320,10 +355,50 @@ export class NotebookApiClient {
   ): Promise<Source> {
     const normalizedParent = normalizeNotebookName(parent);
     const resolvedPath = path.resolve(filePath);
-    if (!fs.existsSync(resolvedPath)) {
-      throw new Error(`File not found: ${resolvedPath}`);
+
+    let realFilePath: string;
+    try {
+      realFilePath = await fs.promises.realpath(resolvedPath);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+        throw new Error(`File not found: ${resolvedPath}`);
+      }
+      throw err;
     }
-    const stat = fs.statSync(resolvedPath);
+
+    const blockedPaths = await Promise.all([
+      resolveRealOrAbsolutePath(getClientSecretPath()),
+      resolveRealOrAbsolutePath(getTokenPath()),
+      resolveRealOrAbsolutePath(getPendingAuthStatePath()),
+    ]);
+    if (blockedPaths.includes(realFilePath)) {
+      throw new Error(`Refusing to upload sensitive MCP auth file: ${resolvedPath}`);
+    }
+
+    const uploadRootEnv = process.env.NOTEBOOK_UPLOAD_ROOT?.trim();
+    if (uploadRootEnv) {
+      let realRoot: string;
+      try {
+        realRoot = await fs.promises.realpath(path.resolve(uploadRootEnv));
+      } catch (err) {
+        throw new Error(
+          `Invalid NOTEBOOK_UPLOAD_ROOT (${uploadRootEnv}): ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+      const rel = path.relative(realRoot, realFilePath);
+      if (
+        rel === "" ||
+        rel === ".." ||
+        rel.startsWith(`..${path.sep}`) ||
+        path.isAbsolute(rel)
+      ) {
+        throw new Error(
+          `Refusing to upload file outside NOTEBOOK_UPLOAD_ROOT (${realRoot}): ${resolvedPath}`
+        );
+      }
+    }
+
+    const stat = await fs.promises.stat(realFilePath);
     if (!stat.isFile()) {
       throw new Error(`Path is not a file: ${resolvedPath}`);
     }
@@ -333,7 +408,7 @@ export class NotebookApiClient {
       );
     }
 
-    const mimeType = options?.mimeType || inferMimeType(resolvedPath);
+    const mimeType = options?.mimeType || inferMimeType(resolvedPath) || inferMimeType(realFilePath);
     if (!mimeType) {
       throw new Error(
         `Could not infer MIME type for "${path.basename(resolvedPath)}". Pass mimeType explicitly (e.g. application/pdf, text/markdown, audio/mpeg, image/png).`
@@ -349,7 +424,7 @@ export class NotebookApiClient {
     url.searchParams.set("uploadType", "media");
     url.searchParams.set("source.displayName", displayName);
 
-    const fileBytes = fs.readFileSync(resolvedPath);
+    const fileBytes = await fs.promises.readFile(realFilePath);
     const response = await this.requestJson<{ source?: Source } & Partial<Source>>(url.toString(), {
       method: "POST",
       headers: { "Content-Type": mimeType },
@@ -359,9 +434,11 @@ export class NotebookApiClient {
     return response.source ?? (response as Source);
   }
 
-  async getSource(name: string): Promise<Source> {
+  async getSource(name: string, options?: { deadlineMs?: number }): Promise<Source> {
     const normalized = name.trim().replace(/^\/+/, "");
-    return this.requestJson<Source>(`${API_BASE}/${normalized}`);
+    return this.requestJson<Source>(`${API_BASE}/${normalized}`, {
+      deadlineMs: options?.deadlineMs,
+    });
   }
 
   async listSources(
@@ -384,7 +461,7 @@ export class NotebookApiClient {
     let delayMs = 2000;
 
     while (Date.now() < deadline) {
-      const source = await this.getSource(name);
+      const source = await this.getSource(name, { deadlineMs: deadline });
       if (source.state === "ACTIVE" || source.state === "FAILED" || source.state === "DELETING") {
         return source;
       }
@@ -394,9 +471,19 @@ export class NotebookApiClient {
       delayMs = Math.min(Math.round(delayMs * 1.5), 10_000);
     }
 
-    const latest = await this.getSource(name);
+    let latestState = "UNKNOWN";
+    try {
+      const latest = await this.getSource(name, { deadlineMs: deadline });
+      if (latest.state === "ACTIVE" || latest.state === "FAILED" || latest.state === "DELETING") {
+        return latest;
+      }
+      latestState = latest.state ?? "UNKNOWN";
+    } catch {
+      // Ignore network/API errors on final status check so the timeout error is not masked.
+    }
+
     throw new Error(
-      `Source ${name} is still in state ${latest.state ?? "UNKNOWN"} after ${timeoutSeconds}s.`
+      `Source ${name} is still in state ${latestState} after ${timeoutSeconds}s.`
     );
   }
 }

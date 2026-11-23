@@ -157,7 +157,7 @@ server.tool(
     wait: z
       .boolean()
       .optional()
-      .describe("If true, poll until the source finishes processing (ACTIVE or FAILED)."),
+      .describe("If true, poll until the source reaches a terminal state (ACTIVE, FAILED, or DELETING)."),
     timeoutSeconds: z
       .number()
       .int()
@@ -170,8 +170,16 @@ server.tool(
     try {
       const created = await client.createSource(parent, { displayName, url, text, mimeType });
       if (wait && created.name) {
-        const finalSource = await client.waitForSource(created.name, timeoutSeconds ?? 120);
-        return jsonResult(finalSource);
+        try {
+          const finalSource = await client.waitForSource(created.name, timeoutSeconds ?? 120);
+          return jsonResult(finalSource);
+        } catch (waitErr) {
+          const waitMessage = waitErr instanceof Error ? waitErr.message : String(waitErr);
+          return errorResult(
+            `Source was created (${created.name}), but waiting/polling for completion failed: ${waitMessage} ` +
+              `Do not retry create_source (which would create a duplicate); call get_source or wait_for_source with "${created.name}" instead.`
+          );
+        }
       }
       return jsonResult(created);
     } catch (err) {
@@ -204,7 +212,7 @@ server.tool(
     wait: z
       .boolean()
       .optional()
-      .describe("If true, poll until the uploaded source reaches ACTIVE or FAILED."),
+      .describe("If true, poll until the uploaded source reaches a terminal state (ACTIVE, FAILED, or DELETING)."),
     timeoutSeconds: z
       .number()
       .int()
@@ -217,8 +225,16 @@ server.tool(
     try {
       const uploaded = await client.uploadSource(parent, filePath, { displayName, mimeType });
       if (wait && uploaded.name) {
-        const finalSource = await client.waitForSource(uploaded.name, timeoutSeconds ?? 120);
-        return jsonResult(finalSource);
+        try {
+          const finalSource = await client.waitForSource(uploaded.name, timeoutSeconds ?? 120);
+          return jsonResult(finalSource);
+        } catch (waitErr) {
+          const waitMessage = waitErr instanceof Error ? waitErr.message : String(waitErr);
+          return errorResult(
+            `Source was uploaded (${uploaded.name}), but waiting/polling for completion failed: ${waitMessage} ` +
+              `Do not retry upload_source (which would create a duplicate); call get_source or wait_for_source with "${uploaded.name}" instead.`
+          );
+        }
       }
       return jsonResult(uploaded);
     } catch (err) {
@@ -278,7 +294,7 @@ server.tool(
 
 server.tool(
   "wait_for_source",
-  "Poll a source until its ingestion state reaches ACTIVE or FAILED.",
+  "Poll a source until its ingestion state reaches a terminal state (ACTIVE, FAILED, or DELETING).",
   {
     name: z
       .string()

@@ -50,10 +50,8 @@ async function runCallbackServer(port: number): Promise<void> {
         server.close(() => resolve());
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
-        res.end(
-          `<!doctype html><html><body style='font-family:system-ui;padding:2rem'><h2>Authentication failed</h2><pre>${message}</pre></body></html>`
-        );
+        res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+        res.end(`Authentication failed: ${message}`);
         server.close(() => reject(err));
       }
     });

@@ -260,19 +260,129 @@ function buildEntry(opts: CliOptions): StdioServerEntry {
   return entry;
 }
 
+function stripJsonc(input: string): string {
+  const text = input.charCodeAt(0) === 0xfeff ? input.slice(1) : input;
+
+  // Pass 1: strip // line comments and /* */ block comments outside string literals
+  let withoutComments = "";
+  let inString = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      withoutComments += ch;
+      if (ch === "\\" && i + 1 < text.length) {
+        withoutComments += text[++i];
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+      withoutComments += ch;
+    } else if (ch === "/" && text[i + 1] === "/") {
+      i += 2;
+      while (i < text.length && text[i] !== "\n" && text[i] !== "\r") {
+        i++;
+      }
+      if (i < text.length) {
+        withoutComments += text[i];
+      }
+    } else if (ch === "/" && text[i + 1] === "*") {
+      i += 2;
+      let closed = false;
+      while (i < text.length) {
+        if (text[i] === "*" && text[i + 1] === "/") {
+          i++;
+          closed = true;
+          break;
+        }
+        i++;
+      }
+      if (!closed) {
+        throw new SyntaxError("Unterminated block comment in JSONC.");
+      }
+      withoutComments += " ";
+    } else {
+      withoutComments += ch;
+    }
+  }
+
+  // Pass 2: strip trailing commas before } or ] outside string literals
+  let result = "";
+  inString = false;
+  for (let i = 0; i < withoutComments.length; i++) {
+    const ch = withoutComments[i];
+    if (inString) {
+      result += ch;
+      if (ch === "\\" && i + 1 < withoutComments.length) {
+        result += withoutComments[++i];
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+      result += ch;
+    } else if (ch === ",") {
+      let j = i + 1;
+      while (j < withoutComments.length && /\s/.test(withoutComments[j])) {
+        j++;
+      }
+      if (withoutComments[j] === "}" || withoutComments[j] === "]") {
+        continue;
+      }
+      result += ch;
+    } else {
+      result += ch;
+    }
+  }
+
+  return result;
+}
+
 function readJsonObject(filePath: string): Record<string, unknown> {
   if (!fs.existsSync(filePath)) {
     return {};
   }
-  const raw = fs.readFileSync(filePath, "utf8").trim();
-  if (!raw) {
+  const raw = fs.readFileSync(filePath, "utf8");
+  const stripped = stripJsonc(raw).trim();
+  if (!stripped) {
     return {};
   }
-  const parsed = JSON.parse(raw) as unknown;
+  const parsed = JSON.parse(stripped) as unknown;
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error(`Existing file ${filePath} does not contain a JSON object.`);
   }
   return parsed as Record<string, unknown>;
+}
+
+function writeJsonAtomic(
+  filePath: string,
+  data: Record<string, unknown>,
+  createBackup: boolean
+): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  if (createBackup && fs.existsSync(filePath)) {
+    fs.copyFileSync(filePath, `${filePath}.bak`);
+  }
+  const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}`;
+  try {
+    fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2) + "\n", "utf8");
+    fs.renameSync(tmpPath, filePath);
+  } catch (err) {
+    try {
+      if (fs.existsSync(tmpPath)) {
+        fs.unlinkSync(tmpPath);
+      }
+    } catch {
+      // Ignore temporary file cleanup errors
+    }
+    throw err;
+  }
 }
 
 function mergeAndWriteJsonConfig(
@@ -302,8 +412,7 @@ function mergeAndWriteJsonConfig(
   };
 
   if (!dryRun) {
-    fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    fs.writeFileSync(filePath, JSON.stringify(updated, null, 2) + "\n", "utf8");
+    writeJsonAtomic(filePath, updated, existed);
   }
 
   return {
@@ -363,12 +472,65 @@ function configureTarget(target: SingleTarget, opts: CliOptions, singleCustomOut
       return;
     }
 
+    const claudeConfigPath = path.join(os.homedir(), ".claude.json");
+    let previousEntry: unknown = undefined;
+    let hadPreviousEntry = false;
+    try {
+      const existingConfig = readJsonObject(claudeConfigPath);
+      const existingServers = existingConfig.mcpServers;
+      if (
+        existingServers &&
+        typeof existingServers === "object" &&
+        !Array.isArray(existingServers) &&
+        Object.prototype.hasOwnProperty.call(existingServers, opts.name)
+      ) {
+        previousEntry = (existingServers as Record<string, unknown>)[opts.name];
+        hadPreviousEntry = true;
+      }
+    } catch {
+      // Unable to inspect ~/.claude.json; proceed without saved rollback entry
+    }
+
+    let removedExisting = false;
     try {
       execFileSync("claude", ["mcp", "remove", opts.name, "-s", "user"], { stdio: "ignore" });
+      removedExisting = true;
     } catch {
       // Not previously registered; ignore
     }
-    execFileSync("claude", cliArgs, { stdio: "inherit" });
+
+    try {
+      execFileSync("claude", cliArgs, { stdio: "inherit" });
+    } catch (addErr) {
+      if (hadPreviousEntry) {
+        try {
+          const currentConfig = readJsonObject(claudeConfigPath);
+          const currentServers = currentConfig.mcpServers;
+          const mergedServers: Record<string, unknown> =
+            currentServers && typeof currentServers === "object" && !Array.isArray(currentServers)
+              ? { ...(currentServers as Record<string, unknown>) }
+              : {};
+          if (removedExisting || !Object.prototype.hasOwnProperty.call(mergedServers, opts.name)) {
+            mergedServers[opts.name] = previousEntry;
+            writeJsonAtomic(
+              claudeConfigPath,
+              { ...currentConfig, mcpServers: mergedServers },
+              false
+            );
+            console.error(
+              `[rollback] claude-code: restored previous "${opts.name}" entry in ${claudeConfigPath} after claude mcp add failed.`
+            );
+          }
+        } catch (restoreErr) {
+          console.error(
+            `[warn] claude-code: failed to restore previous "${opts.name}" entry: ${
+              restoreErr instanceof Error ? restoreErr.message : String(restoreErr)
+            }`
+          );
+        }
+      }
+      throw addErr;
+    }
     console.log(`[ok] claude-code: registered "${opts.name}" via claude CLI (user scope)`);
     return;
   }
@@ -411,8 +573,19 @@ function main(): void {
     );
   }
 
+  let failed = false;
   for (const target of targets) {
-    configureTarget(target, opts, opts.output);
+    try {
+      configureTarget(target, opts, opts.output);
+    } catch (err) {
+      failed = true;
+      console.error(
+        `[error] ${target}: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+  if (failed) {
+    process.exitCode = 1;
   }
 }
 
